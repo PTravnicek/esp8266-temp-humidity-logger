@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP8266 Logger</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/apexcharts.min.js"></script>
+    <script src="/apexcharts-sync-plugin.js"></script>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <div class="header-content">
+                <h1 id="deviceId">ESP8266 Logger</h1>
+                <div class="status-bar">
+                    <span id="liveStatus" class="status-badge">Loading...</span>
+                    <span id="sampleStatus" class="status-badge">Interval: --</span>
+                    <span id="timeStatus" class="status-badge status-warning">Time: --</span>
+                    <span id="storageStatus" class="status-badge">Storage: --</span>
+                </div>
+                <div class="retention-bar">
+                    <span id="capacityStatus" class="status-badge">Capacity: --</span>
+                </div>
+            </div>
+        </header>
+
+        <div class="controls">
+            <div class="time-range">
+                <label>From:</label>
+                <input type="datetime-local" id="fromDate">
+                <label>To:</label>
+                <input type="datetime-local" id="toDate">
+            </div>
+            <div class="quick-ranges">
+                <button onclick="setQuickRange(1)">24h</button>
+                <button onclick="setQuickRange(7)">7d</button>
+                <button onclick="setQuickRange(30)">30d</button>
+                <button onclick="setQuickRange(180)">6mo</button>
+                <button onclick="setQuickRange(365)">1y</button>
+            </div>
+            <div class="actions">
+                <button onclick="loadData()" class="btn-primary">Load</button>
+                <button onclick="toggleAutoRefresh()" id="autoRefreshBtn" class="btn-secondary">Auto: 30s</button>
+                <button onclick="downloadCSV()" class="btn-secondary">Download CSV</button>
+                <button onclick="testSD()" class="btn-secondary">Test SD</button>
+                <button onclick="openSettings()" class="btn-secondary">Settings</button>
+                <span id="dataCount" class="data-count">0 points</span>
+            </div>
+        </div>
+
+        <div class="charts">
+            <div class="chart-container">
+                <h2 data-num="SI7021">Temperature</h2>
+                <div id="tempChart"></div>
+            </div>
+            <div class="chart-container">
+                <h2 data-num="SI7021">Humidity</h2>
+                <div id="humChart"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="settingsModal" class="modal">
+        <div class="modal-content">
+            <h2>Settings</h2>
+            <form id="settingsForm" onsubmit="saveSettings(event)">
+                <div class="form-group">
+                    <label>Sampling Interval:</label>
+                    <div class="interval-input">
+                        <input type="number" id="intervalValue" min="1" required>
+                        <select id="intervalUnit" onchange="updateIntervalConstraints()">
+                            <option value="seconds">Seconds</option>
+                            <option value="minutes">Minutes</option>
+                            <option value="hours" selected>Hours</option>
+                            <option value="days">Days</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-actions">
+                    <button type="submit" class="btn-primary">Save</button>
+                    <button type="button" onclick="closeSettings()" class="btn-secondary">Cancel</button>
+                </div>
+            </form>
+            <div id="settingsError" class="error-message"></div>
+        </div>
+    </div>
+
+    <!-- Time Set Modal -->
+    <div id="timeModal" class="modal">
+        <div class="modal-content">
+            <h2>Set Device Time</h2>
+            <p>Device time is not set. Please set it now.</p>
+            <button onclick="setDeviceTime()" class="btn-primary">Set Time from Browser</button>
+            <div id="timeError" class="error-message"></div>
+        </div>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+</html>
+
