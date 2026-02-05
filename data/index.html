@@ -3,16 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ESP8266 Logger</title>
+    <title>SHT85 Logger</title>
     <link rel="stylesheet" href="/styles.css">
-    <script src="/apexcharts.min.js"></script>
-    <script src="/apexcharts-sync-plugin.js"></script>
 </head>
 <body>
     <div class="container">
         <header class="header">
             <div class="header-content">
-                <h1 id="deviceId">ESP8266 Logger</h1>
+                <h1 id="deviceId">SHT85 Logger</h1>
                 <div class="status-bar">
                     <span id="liveStatus" class="status-badge">Loading...</span>
                     <span id="sampleStatus" class="status-badge">Interval: --</span>
@@ -21,6 +19,11 @@
                 </div>
                 <div class="retention-bar">
                     <span id="capacityStatus" class="status-badge">Capacity: --</span>
+                    <div class="retention-controls">
+                        <label>Prune days:</label>
+                        <input type="number" id="pruneDays" min="1" value="30">
+                        <button id="pruneBtn" onclick="pruneLfs()" class="btn-secondary">Prune</button>
+                    </div>
                 </div>
             </div>
         </header>
@@ -51,11 +54,11 @@
 
         <div class="charts">
             <div class="chart-container">
-                <h2 data-num="SI7021">Temperature</h2>
+                <h2 data-num="SHT85">Temperature</h2>
                 <div id="tempChart"></div>
             </div>
             <div class="chart-container">
-                <h2 data-num="SI7021">Humidity</h2>
+                <h2 data-num="SHT85">Humidity</h2>
                 <div id="humChart"></div>
             </div>
         </div>
@@ -78,6 +81,15 @@
                         </select>
                     </div>
                 </div>
+                <div class="form-group">
+                    <label>Sensor heating:</label>
+                    <select id="heatingMode">
+                        <option value="off">No heating</option>
+                        <option value="10s_5min">10 s every 5 minutes</option>
+                        <option value="1min_1hr">1 min every hour</option>
+                        <option value="1min_1day">1 min every day</option>
+                    </select>
+                </div>
                 <div class="form-actions">
                     <button type="submit" class="btn-primary">Save</button>
                     <button type="button" onclick="closeSettings()" class="btn-secondary">Cancel</button>
@@ -97,6 +109,8 @@
         </div>
     </div>
 
+    <script src="/apexcharts.min.js"></script>
+    <script src="/apexcharts-sync-plugin.js"></script>
     <script src="/app.js"></script>
 </body>
 </html>

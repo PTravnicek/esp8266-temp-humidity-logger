@@ -1,26 +1,32 @@
 #include <Arduino.h>
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
+#include <WiFi.h>
+#include <WebServer.h>
 #include <LittleFS.h>
 #include <SD.h>
 #include <SPI.h>
+#include <Wire.h>
 #include <ArduinoJson.h>
-#include <Adafruit_Si7021.h>
+#include <SHT85.h>
 #include <RTClib.h>
 #include <time.h>
+#include <mbedtls/sha256.h>
 
-// Hardware objects
-Adafruit_Si7021 sensor = Adafruit_Si7021();
+// Hardware objects (SHT85 I2C default address 0x44)
+SHT85 sht(0x44);
 RTC_PCF8523 rtc;
 bool rtcPresent = false;
+bool sensorPresent = false;
 
-// LED indicator (GPIO0 = red LED on HUZZAH, active LOW)
-#define LED_PIN 0
+// FireBeetle 2 ESP32-S3: onboard LED = GPIO 21 (D13), I2C default SDA=1 SCL=2, SD_CS=9
+#define LED_PIN 21
+#define SD_CS 9
+#define I2C_SDA 1
+#define I2C_SCL 2
 unsigned long lastHeartbeat = 0;
 const unsigned long HEARTBEAT_INTERVAL = 3000; // 3 seconds
 
 // Network objects
-ESP8266WebServer server(80);
+WebServer server(80);
 IPAddress apIP(192, 168, 4, 1);
 
 // Config structure
@@ -35,6 +41,7 @@ struct Config {
   int32_t log_timezone_offset_min = 0;
   String file_rotation = "monthly";
   bool time_set = false;
+  String heating_mode = "off";
 } config;
 
 // Session management
@@ -51,9 +58,14 @@ unsigned long lastSampleTime = 0;
 bool sdPresent = false;
 uint32_t writeErrors = 0;
 
-// LittleFS ring-buffer settings
+// SHT85 heater state machine (non-blocking)
+bool heaterActive = false;           // true while heater is on
+unsigned long heaterStartMs = 0;    // when current heating started
+unsigned long lastHeaterCycleEndMs = 0;  // when last heating cycle ended
+
+// LittleFS ring-buffer settings (match larger partition; was 256 KB)
 #ifndef LFS_RING_MAX_BYTES_DEFAULT
-#define LFS_RING_MAX_BYTES_DEFAULT (256 * 1024)
+#define LFS_RING_MAX_BYTES_DEFAULT (4 * 1024 * 1024)
 #endif
 #ifndef LFS_RING_RECORD_LEN_DEFAULT
 #define LFS_RING_RECORD_LEN_DEFAULT 96
@@ -63,22 +75,38 @@ const size_t LFS_RING_RECORD_LEN = LFS_RING_RECORD_LEN_DEFAULT;
 
 // Helper functions
 String getChipId() {
-  return String(ESP.getChipId(), HEX);
+  uint64_t mac = ESP.getEfuseMac();
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%04x%08x", (uint32_t)(mac >> 32), (uint32_t)mac);
+  return String(buf);
 }
 
 time_t parseISO8601(const String& iso);
 
 String generateSessionToken() {
-  String token = "";
-  for (int i = 0; i < 32; i++) {
-    token += String(random(0, 16), HEX);
-  }
-  return token;
+  // 128-bit token encoded as 32 hex chars
+  uint32_t a = esp_random();
+  uint32_t b = esp_random();
+  uint32_t c = esp_random();
+  uint32_t d = esp_random();
+  char buf[33];
+  snprintf(buf, sizeof(buf), "%08x%08x%08x%08x", a, b, c, d);
+  return String(buf);
 }
 
-String hashPassword(const String& password, const String& salt) {
-  // Simple SHA-256 would require additional library
-  // For now, use a simple hash (in production, use proper SHA-256)
+String bytesToHex(const uint8_t* bytes, size_t len) {
+  const char* hex = "0123456789abcdef";
+  String out;
+  out.reserve(len * 2);
+  for (size_t i = 0; i < len; i++) {
+    out += hex[(bytes[i] >> 4) & 0x0F];
+    out += hex[bytes[i] & 0x0F];
+  }
+  return out;
+}
+
+String hashPasswordLegacy(const String& password, const String& salt) {
+  // Legacy (weak) 32-bit hash kept for backward-compat with existing config.json
   String combined = password + salt;
   uint32_t hash = 0;
   for (size_t i = 0; i < combined.length(); i++) {
@@ -87,16 +115,43 @@ String hashPassword(const String& password, const String& salt) {
   return String(hash, HEX);
 }
 
+String hashPasswordSHA256(const String& password, const String& salt) {
+  String combined = password + salt;
+  uint8_t out[32];
+
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts_ret(&ctx, 0 /* is224 */);
+  mbedtls_sha256_update_ret(&ctx, (const unsigned char*)combined.c_str(), combined.length());
+  mbedtls_sha256_finish_ret(&ctx, out);
+  mbedtls_sha256_free(&ctx);
+
+  return bytesToHex(out, sizeof(out));
+}
+
+String hashPassword(const String& password, const String& salt) {
+  // Default to strong hashing for new configs
+  return hashPasswordSHA256(password, salt);
+}
+
 String generateSalt() {
-  String salt = "";
-  for (int i = 0; i < 16; i++) {
-    salt += String(random(0, 16), HEX);
-  }
-  return salt;
+  // 64-bit salt encoded as 16 hex chars
+  uint32_t a = esp_random();
+  uint32_t b = esp_random();
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%08x%08x", a, b);
+  return String(buf);
 }
 
 bool verifyPassword(const String& password, const String& hash, const String& salt) {
-  String computed = hashPassword(password, salt);
+  if (hash.length() >= 64) {
+    String computed = hashPasswordSHA256(password, salt);
+    String h = hash;
+    computed.toLowerCase();
+    h.toLowerCase();
+    return computed == h;
+  }
+  String computed = hashPasswordLegacy(password, salt);
   return computed == hash;
 }
 
@@ -189,14 +244,28 @@ bool loadConfig() {
   }
   
   config.config_version = doc["config_version"] | 1;
-  config.device_id = doc["device_id"] | ("LOGGER_" + getChipId());
-  config.ap_ssid = doc["ap_ssid"] | ("LOGGER_" + getChipId());
-  config.ap_password = doc["ap_password"] | "logger123";
-  config.auth_hash = doc["auth_hash"] | "";
-  config.auth_salt = doc["auth_salt"] | "";
+  {
+    const char* p;
+    p = doc["device_id"].as<const char*>();
+    config.device_id = (p && p[0]) ? String(p) : ("LOGGER_" + getChipId());
+    p = doc["ap_ssid"].as<const char*>();
+    config.ap_ssid = (p && p[0]) ? String(p) : ("LOGGER_" + getChipId());
+    p = doc["ap_password"].as<const char*>();
+    config.ap_password = (p && p[0]) ? String(p) : "logger123";
+    if (config.ap_password.length() < 8 || config.ap_password.length() > 63) {
+      config.ap_password = "logger123";
+    }
+    p = doc["auth_hash"].as<const char*>();
+    config.auth_hash = p ? String(p) : "";
+    p = doc["auth_salt"].as<const char*>();
+    config.auth_salt = p ? String(p) : "";
+    p = doc["file_rotation"].as<const char*>();
+    config.file_rotation = (p && p[0]) ? String(p) : "monthly";
+    p = doc["heating_mode"].as<const char*>();
+    config.heating_mode = (p && p[0]) ? String(p) : "off";
+  }
   config.sample_period_s = doc["sample_period_s"] | 3600;
   config.log_timezone_offset_min = doc["log_timezone_offset_min"] | 0;
-  config.file_rotation = doc["file_rotation"] | "monthly";
   config.time_set = doc["time_set"] | false;
   
   return true;
@@ -214,6 +283,7 @@ bool saveConfig() {
   doc["log_timezone_offset_min"] = config.log_timezone_offset_min;
   doc["file_rotation"] = config.file_rotation;
   doc["time_set"] = config.time_set;
+  doc["heating_mode"] = config.heating_mode;
   
   File file = LittleFS.open("/config.json", "w");
   if (!file) {
@@ -240,6 +310,7 @@ void getDefaultConfig() {
   config.log_timezone_offset_min = 0;
   config.file_rotation = "monthly";
   config.time_set = false;
+  config.heating_mode = "off";
 }
 
 // Time functions
@@ -525,9 +596,17 @@ void handleLogin() {
     
     String password = server.arg("password");
     if (verifyPassword(password, config.auth_hash, config.auth_salt)) {
+      // If the stored hash is legacy (32-bit), transparently upgrade it on successful login.
+      if (config.auth_hash.length() < 64) {
+        config.auth_salt = generateSalt();
+        config.auth_hash = hashPasswordSHA256(password, config.auth_salt);
+        saveConfig();
+      }
+
       String token = generateSessionToken();
       addSession(token);
-      server.sendHeader("Set-Cookie", "SESSION=" + token + "; Path=/; Max-Age=3600");
+      // Cookie hardening: HttpOnly + SameSite. (No Secure flag because this is usually served over plain HTTP on a local AP.)
+      server.sendHeader("Set-Cookie", "SESSION=" + token + "; Path=/; Max-Age=3600; HttpOnly; SameSite=Strict");
       server.send(200, "application/json", "{\"success\":true}");
     } else {
       server.send(401, "application/json", "{\"error\":\"Invalid password\"}");
@@ -540,7 +619,7 @@ void handleLogout() {
   if (token.length() > 0) {
     removeSession(token);
   }
-  server.sendHeader("Set-Cookie", "SESSION=; Path=/; Max-Age=0");
+  server.sendHeader("Set-Cookie", "SESSION=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict");
   server.sendHeader("Location", "/login");
   server.send(302, "text/plain", "");
 }
@@ -555,6 +634,7 @@ void handleApiConfig() {
     doc["log_timezone_offset_min"] = config.log_timezone_offset_min;
     doc["file_rotation"] = config.file_rotation;
     doc["time_set"] = config.time_set;
+    doc["heating_mode"] = config.heating_mode;
     
     String response;
     serializeJson(doc, response);
@@ -584,6 +664,16 @@ void handleApiConfig() {
     
     if (doc.containsKey("log_timezone_offset_min")) {
       config.log_timezone_offset_min = doc["log_timezone_offset_min"];
+    }
+    
+    if (doc.containsKey("heating_mode")) {
+      const char* mode = doc["heating_mode"].as<const char*>();
+      if (mode) {
+        String m = String(mode);
+        if (m == "off" || m == "10s_5min" || m == "1min_1hr" || m == "1min_1day") {
+          config.heating_mode = m;
+        }
+      }
     }
     
     if (saveConfig()) {
@@ -645,13 +735,16 @@ void handleApiTime() {
 void handleApiStorage() {
   // No auth required - WiFi password is sufficient
   
-  FSInfo fsInfo;
-  LittleFS.info(fsInfo);
+  size_t lfsTotal = LittleFS.totalBytes();
+  size_t lfsUsed = LittleFS.usedBytes();
   size_t bytesPerSample = estimateSampleBytes();
-  size_t freeBytes = fsInfo.totalBytes - fsInfo.usedBytes;
+  size_t freeBytes = lfsTotal - lfsUsed;
   size_t capacityBytes = LFS_RING_MAX_BYTES;
-  if (capacityBytes > fsInfo.totalBytes) {
-    capacityBytes = fsInfo.totalBytes;
+  if (capacityBytes > lfsTotal) {
+    capacityBytes = lfsTotal;
+  }
+  if (capacityBytes > freeBytes) {
+    capacityBytes = freeBytes;
   }
   unsigned long samplePeriod = config.sample_period_s;
   unsigned long estSamples = 0;
@@ -662,8 +755,8 @@ void handleApiStorage() {
   }
   
   DynamicJsonDocument doc(768);
-  doc["lfs"]["total"] = fsInfo.totalBytes;
-  doc["lfs"]["used"] = fsInfo.usedBytes;
+  doc["lfs"]["total"] = lfsTotal;
+  doc["lfs"]["used"] = lfsUsed;
   doc["lfs"]["free"] = freeBytes;
   doc["sd"]["present"] = sdPresent;
   doc["write_errors"] = writeErrors;
@@ -673,7 +766,7 @@ void handleApiStorage() {
   doc["retention"]["est_duration_s"] = estDuration;
   
   if (sdPresent) {
-    // ESP8266 SD library doesn't provide card size info easily
+    // SD card size info not always available
     doc["sd"]["total"] = 0;
     doc["sd"]["used"] = 0;
     doc["sd"]["free"] = 0;
@@ -714,23 +807,158 @@ void handleApiPrune() {
   int deletedFiles = 0;
   size_t freedBytes = 0;
 
-  Dir dir = LittleFS.openDir("/logs");
-  while (dir.next()) {
-    if (!dir.fileName().endsWith(".csv")) {
+  auto sendEmpty = [&]() {
+    DynamicJsonDocument docEmpty(256);
+    docEmpty["deleted_samples"] = 0;
+    docEmpty["kept_samples"] = 0;
+    docEmpty["deleted_files"] = 0;
+    docEmpty["freed_bytes"] = 0;
+    String resp;
+    serializeJson(docEmpty, resp);
+    server.send(200, "application/json", resp);
+  };
+
+  File root = LittleFS.open("/logs");
+  if (!root || !root.isDirectory()) {
+    root.close();
+    sendEmpty();
+    return;
+  }
+
+  File file = root.openNextFile();
+  while (file) {
+    String fileName = file.name();
+    if (!fileName.endsWith(".csv")) {
+      file = root.openNextFile();
       continue;
+    }
+    if (!fileName.startsWith("/")) {
+      fileName = "/logs/" + fileName;
     }
 
-    String fileName = dir.fileName();
-    size_t originalSize = dir.fileSize();
-    File file = dir.openFile("r");
-    if (!file) {
-      continue;
-    }
+    size_t originalSize = file.size();
+
+    // Detect ring-buffer format
+    file.seek(0);
+    size_t dataStart = 0;
+    unsigned long offset = 0;
+    unsigned long count = 0;
+    size_t slots = 0;
+    bool isRing = lfsRingReadHeader(file, dataStart, offset, count, slots);
 
     String tmpName = fileName + ".tmp";
+
+    if (isRing) {
+      // Prune ring-buffer file without corrupting the RB1 format.
+      File tmp = LittleFS.open(tmpName, "w+");
+      if (!tmp) {
+        file.close();
+        file = root.openNextFile();
+        continue;
+      }
+
+      lfsRingWriteHeader(tmp, 0, 0);
+      size_t tmpDataStart = lfsRingHeaderSize();
+      size_t tmpSlots = lfsRingSlotCount(tmpDataStart);
+      if (tmpSlots == 0) {
+        tmp.close();
+        file.close();
+        LittleFS.remove(tmpName);
+        file = root.openNextFile();
+        continue;
+      }
+
+      unsigned long keptInFile = 0;
+      unsigned long startIndex = (offset + slots - count) % slots;
+      for (unsigned long i = 0; i < count; i++) {
+        unsigned long idx = (startIndex + i) % slots;
+        size_t pos = dataStart + (idx * LFS_RING_RECORD_LEN);
+        file.seek(pos);
+
+        char buf[LFS_RING_RECORD_LEN + 1];
+        size_t read = file.readBytes(buf, LFS_RING_RECORD_LEN);
+        buf[read] = '\0';
+
+        String line = lfsRingTrimRecord(buf, read);
+        if (line.length() == 0) {
+          continue;
+        }
+
+        int comma1 = line.indexOf(',');
+        if (comma1 <= 0) {
+          deletedSamples++;
+          continue;
+        }
+
+        String tsStr = line.substring(0, comma1);
+        time_t tsTime = parseISO8601(tsStr);
+        if (tsTime != 0 && tsTime >= cutoff) {
+          // Format fixed-length record and write to next slot
+          String record = line;
+          if (record.endsWith("\n")) {
+            record.remove(record.length() - 1);
+          }
+          if (record.length() > LFS_RING_RECORD_LEN - 1) {
+            record = record.substring(0, LFS_RING_RECORD_LEN - 1);
+          }
+          while (record.length() < LFS_RING_RECORD_LEN - 1) {
+            record += " ";
+          }
+          record += "\n";
+
+          size_t wpos = tmpDataStart + (keptInFile * LFS_RING_RECORD_LEN);
+          tmp.seek(wpos);
+          size_t written = tmp.print(record);
+          if (written != LFS_RING_RECORD_LEN) {
+            // Stop on write error
+            break;
+          }
+
+          keptSamples++;
+          keptInFile++;
+        } else {
+          deletedSamples++;
+        }
+
+        yield();
+      }
+
+      unsigned long newCount = keptInFile;
+      unsigned long newOffset = (tmpSlots > 0) ? (newCount % tmpSlots) : 0;
+      lfsRingWriteHeader(tmp, newOffset, newCount);
+      tmp.flush();
+      tmp.close();
+      file.close();
+
+      if (newCount == 0) {
+        LittleFS.remove(fileName);
+        LittleFS.remove(tmpName);
+        deletedFiles++;
+        freedBytes += originalSize;
+      } else {
+        size_t newSize = 0;
+        File tmpRead = LittleFS.open(tmpName, "r");
+        if (tmpRead) {
+          newSize = tmpRead.size();
+          tmpRead.close();
+        }
+        LittleFS.remove(fileName);
+        LittleFS.rename(tmpName, fileName);
+        if (originalSize > newSize) {
+          freedBytes += (originalSize - newSize);
+        }
+      }
+
+      yield();
+      file = root.openNextFile();
+      continue;
+    }
+
+    // Plain CSV pruning (legacy files)
     File tmp = LittleFS.open(tmpName, "w");
     if (!tmp) {
       file.close();
+      file = root.openNextFile();
       continue;
     }
 
@@ -742,7 +970,6 @@ void handleApiPrune() {
     }
 
     int fileKept = 0;
-
     while (file.available()) {
       line = file.readStringUntil('\n');
       if (line.length() == 0) break;
@@ -790,31 +1017,75 @@ void handleApiPrune() {
     }
 
     yield();
+    file = root.openNextFile();
   }
+  root.close();
 
   DynamicJsonDocument doc(512);
   doc["deleted_samples"] = deletedSamples;
   doc["kept_samples"] = keptSamples;
   doc["deleted_files"] = deletedFiles;
   doc["freed_bytes"] = freedBytes;
-  
+
   String response;
   serializeJson(doc, response);
   server.send(200, "application/json", response);
 }
 
-// Parse ISO8601 timestamp to epoch (simplified)
+
+static bool isLeapYear(int year) {
+  return ((year % 4) == 0 && (year % 100) != 0) || ((year % 400) == 0);
+}
+
+static int daysInMonth(int year, int month) {
+  static const int mdays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (month < 1 || month > 12) return 0;
+  if (month == 2) return mdays[1] + (isLeapYear(year) ? 1 : 0);
+  return mdays[month - 1];
+}
+
+static time_t timegmCompat(const struct tm& t) {
+  // Convert a UTC tm into Unix epoch seconds (no timezone/DST effects).
+  int year = t.tm_year + 1900;
+  int month = t.tm_mon + 1;
+  int day = t.tm_mday;
+
+  if (year < 1970 || month < 1 || month > 12 || day < 1 || day > 31) return 0;
+
+  int64_t days = 0;
+  for (int y = 1970; y < year; y++) {
+    days += isLeapYear(y) ? 366 : 365;
+  }
+  for (int m = 1; m < month; m++) {
+    days += daysInMonth(year, m);
+  }
+  days += (day - 1);
+
+  int64_t seconds = days * 86400LL + (int64_t)t.tm_hour * 3600LL + (int64_t)t.tm_min * 60LL + (int64_t)t.tm_sec;
+  if (seconds < 0) return 0;
+  return (time_t)seconds;
+}
+
+// Parse ISO8601 timestamp to epoch (UTC). Accepts: YYYY-MM-DDTHH:MM:SSZ
 time_t parseISO8601(const String& iso) {
-  // Format: YYYY-MM-DDTHH:MM:SSZ
   if (iso.length() < 19) return 0;
-  
+  if (iso.charAt(4) != '-' || iso.charAt(7) != '-' || iso.charAt(10) != 'T' || iso.charAt(13) != ':' || iso.charAt(16) != ':') {
+    return 0;
+  }
+
   int year = iso.substring(0, 4).toInt();
   int month = iso.substring(5, 7).toInt();
   int day = iso.substring(8, 10).toInt();
   int hour = iso.substring(11, 13).toInt();
   int minute = iso.substring(14, 16).toInt();
   int second = iso.substring(17, 19).toInt();
-  
+
+  if (month < 1 || month > 12) return 0;
+  if (day < 1 || day > daysInMonth(year, month)) return 0;
+  if (hour < 0 || hour > 23) return 0;
+  if (minute < 0 || minute > 59) return 0;
+  if (second < 0 || second > 59) return 0;
+
   struct tm timeinfo = {0};
   timeinfo.tm_year = year - 1900;
   timeinfo.tm_mon = month - 1;
@@ -822,8 +1093,8 @@ time_t parseISO8601(const String& iso) {
   timeinfo.tm_hour = hour;
   timeinfo.tm_min = minute;
   timeinfo.tm_sec = second;
-  
-  return mktime(&timeinfo);
+
+  return timegmCompat(timeinfo);
 }
 
 void handleApiData() {
@@ -856,12 +1127,19 @@ void handleApiData() {
 
   bool firstPoint = true;
   
-  // Iterate through log files
-  Dir dir = LittleFS.openDir("/logs");
-  while (dir.next() && pointCount < MAX_POINTS) {
-    if (dir.fileName().endsWith(".csv")) {
-      File file = dir.openFile("r");
-      if (file) {
+  // Iterate through log files (ESP32: File openNextFile)
+  File dataRoot = LittleFS.open("/logs");
+  if (!dataRoot || !dataRoot.isDirectory()) {
+    dataRoot.close();
+    server.sendContent("]");
+    server.sendContent(",\"count\":0}");
+    server.sendContent("");
+    server.client().stop();
+    return;
+  }
+  File file = dataRoot.openNextFile();
+  while (file && pointCount < MAX_POINTS) {
+    if (String(file.name()).endsWith(".csv")) {
         size_t dataStart = 0;
         unsigned long offset = 0;
         unsigned long count = 0;
@@ -947,11 +1225,11 @@ void handleApiData() {
           yield(); // Yield to prevent watchdog
           }
         }
-        file.close();
-      }
     }
     yield();
+    file = dataRoot.openNextFile();
   }
+  dataRoot.close();
   
   server.sendContent("]");
   server.sendContent(",\"count\":" + String(pointCount));
@@ -1043,12 +1321,12 @@ void handleApiDownload() {
       yield();
     }
   } else {
-    // Use LittleFS only (SD doesn't support Dir iteration on ESP8266)
-    Dir dir = LittleFS.openDir("/logs");
-    while (dir.next()) {
-      if (dir.fileName().endsWith(".csv")) {
-        File file = dir.openFile("r");
-        if (file) {
+    // LittleFS directory iteration (ESP32: openNextFile)
+    File dlRoot = LittleFS.open("/logs");
+    if (dlRoot && dlRoot.isDirectory()) {
+      File file = dlRoot.openNextFile();
+      while (file) {
+        if (String(file.name()).endsWith(".csv")) {
           size_t dataStart = 0;
           unsigned long offset = 0;
           unsigned long count = 0;
@@ -1105,10 +1383,11 @@ void handleApiDownload() {
               yield();
             }
           }
-          file.close();
         }
+        yield();
+        file = dlRoot.openNextFile();
       }
-      yield();
+      dlRoot.close();
     }
   }
   
@@ -1122,14 +1401,18 @@ void handleApiFiles() {
   DynamicJsonDocument doc(2048);
   JsonArray files = doc.createNestedArray("files");
   
-  // Use LittleFS only (SD doesn't support Dir iteration on ESP8266)
-  Dir dir = LittleFS.openDir("/logs");
-  while (dir.next()) {
-    if (dir.fileName().endsWith(".csv")) {
-      JsonObject fileObj = files.createNestedObject();
-      fileObj["name"] = dir.fileName();
-      fileObj["size"] = dir.fileSize();
+  File root = LittleFS.open("/logs");
+  if (root && root.isDirectory()) {
+    File file = root.openNextFile();
+    while (file) {
+      if (String(file.name()).endsWith(".csv")) {
+        JsonObject fileObj = files.createNestedObject();
+        fileObj["name"] = file.name();
+        fileObj["size"] = file.size();
+      }
+      file = root.openNextFile();
     }
+    root.close();
   }
   
   String response;
@@ -1141,11 +1424,18 @@ void handleApiStatus() {
   // Debug endpoint - shows current state
   DynamicJsonDocument doc(1400);
   
-  // Current sensor readings
-  float temperature = sensor.readTemperature();
-  float humidity = sensor.readHumidity();
-  doc["sensor"]["temperature"] = temperature;
-  doc["sensor"]["humidity"] = humidity;
+  // Sensor: only include readings when sensor is present (no-sensor mode for website test)
+  doc["sensor"]["connected"] = sensorPresent;
+  if (sensorPresent) {
+    if (sht.read(true)) {
+      doc["sensor"]["temperature"] = sht.getTemperature();
+      doc["sensor"]["humidity"] = sht.getHumidity();
+    } else {
+      doc["sensor"]["temperature"] = (float)((double)0.0 / 0.0);  // read failed
+      doc["sensor"]["humidity"] = (float)((double)0.0 / 0.0);
+    }
+  }
+  // When !sensorPresent, omit temperature/humidity; frontend checks connected
   
   // Time info
   doc["time"]["iso"] = getISOTimestamp();
@@ -1156,27 +1446,46 @@ void handleApiStatus() {
   doc["config"]["sample_period_s"] = config.sample_period_s;
   doc["config"]["device_id"] = config.device_id;
   
-  // Storage
-  FSInfo fsInfo;
-  LittleFS.info(fsInfo);
-  doc["storage"]["lfs_used"] = fsInfo.usedBytes;
-  doc["storage"]["lfs_total"] = fsInfo.totalBytes;
+  // Heating (SHT85 built-in heater)
+  doc["heating"]["mode"] = config.heating_mode;
+  doc["heating"]["on"] = sensorPresent ? sht.isHeaterOn() : false;
+  
+  // Storage (ESP32: totalBytes/usedBytes)
+  doc["storage"]["lfs_used"] = LittleFS.usedBytes();
+  doc["storage"]["lfs_total"] = LittleFS.totalBytes();
   doc["storage"]["sd_present"] = sdPresent;
   
-  // Log files
+  // Log files and ring status (ESP32: openNextFile)
+  // Don't use exists() or open() for missing files - ESP32 VFS logs "no permits for creation" on both
+  String currentLog = getLogFilename();
+  String currentLogBase = currentLog;
+  if (currentLog.lastIndexOf('/') >= 0) {
+    currentLogBase = currentLog.substring(currentLog.lastIndexOf('/') + 1);
+  }
+  bool currentLogExists = false;
+
   JsonArray files = doc.createNestedArray("log_files");
-  Dir dir = LittleFS.openDir("/logs");
-  while (dir.next()) {
-    JsonObject f = files.createNestedObject();
-    f["name"] = dir.fileName();
-    f["size"] = dir.fileSize();
+  File root = LittleFS.open("/logs");
+  if (root && root.isDirectory()) {
+    File file = root.openNextFile();
+    while (file) {
+      if (String(file.name()).endsWith(".csv")) {
+        JsonObject f = files.createNestedObject();
+        f["name"] = file.name();
+        f["size"] = file.size();
+        String fn = file.name();
+        if (fn == currentLog || fn.endsWith("/" + currentLogBase) || fn == currentLogBase) {
+          currentLogExists = true;
+        }
+      }
+      file = root.openNextFile();
+    }
+    root.close();
   }
 
-  // Ring buffer status for current log file (LittleFS)
-  String currentLog = getLogFilename();
   JsonObject ring = doc.createNestedObject("ring");
   ring["file"] = currentLog;
-  if (LittleFS.exists(currentLog)) {
+  if (currentLogExists) {
     File file = LittleFS.open(currentLog, "r");
     if (file) {
       size_t dataStart = 0;
@@ -1220,7 +1529,7 @@ void handleApiTestSD() {
   
   // Try to write a test file
   String testFile = "/sd_test.txt";
-  String testData = "ESP8266 SD Test - " + getISOTimestamp();
+  String testData = "FireBeetle2 SD Test - " + getISOTimestamp();
   
   File file = SD.open(testFile, FILE_WRITE);
   if (!file) {
@@ -1252,7 +1561,7 @@ void handleApiTestSD() {
   // Delete test file
   SD.remove(testFile);
   
-  if (readBack.startsWith("ESP8266 SD Test")) {
+  if (readBack.startsWith("FireBeetle2 SD Test")) {
     doc["success"] = true;
     doc["message"] = "SD card read/write test passed";
   } else {
@@ -1293,7 +1602,6 @@ void handleStaticFile() {
     server.send(404, "text/plain", "File not found");
     return;
   }
-  
   server.streamFile(file, contentType);
   file.close();
 }
@@ -1310,41 +1618,44 @@ void handleNotFound() {
   server.send(302, "text/plain", "");
 }
 
-// LED indicator functions
+// LED indicator functions (FireBeetle 2: active HIGH)
 void ledHeartbeat() {
-  // Single short flash
-  digitalWrite(LED_PIN, LOW);  // LED ON (active low)
+  digitalWrite(LED_PIN, HIGH);  // LED ON
   delay(50);
-  digitalWrite(LED_PIN, HIGH); // LED OFF
+  digitalWrite(LED_PIN, LOW);   // LED OFF
 }
 
 void ledSampleFlash() {
-  // Rapid triple flash to indicate data saved
   for (int i = 0; i < 3; i++) {
-    digitalWrite(LED_PIN, LOW);  // LED ON
+    digitalWrite(LED_PIN, HIGH);  // LED ON
     delay(80);
-    digitalWrite(LED_PIN, HIGH); // LED OFF
+    digitalWrite(LED_PIN, LOW);   // LED OFF
     delay(80);
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(500);
   
-  // Initialize LED indicator
+  // Initialize LED indicator (FireBeetle 2: GPIO 21, active HIGH)
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH); // LED OFF (active low)
+  digitalWrite(LED_PIN, LOW);  // LED OFF
   
-  Serial.println("\n\nESP8266 Temperature/Humidity Logger");
-  Serial.println("====================================");
+  Serial.println("\n\nFireBeetle 2 SHT85 Temperature/Humidity Logger");
+  Serial.println("================================================");
   
-  // Initialize LittleFS
-  if (!LittleFS.begin()) {
-    Serial.println("LittleFS mount failed!");
-    return;
+  // Initialize LittleFS; format on corrupt (e.g. first boot or different board)
+  if (!LittleFS.begin(false)) {  // false = do not format on first try
+    Serial.println("LittleFS mount failed, formatting...");
+    if (!LittleFS.begin(true)) {  // true = format then mount
+      Serial.println("LittleFS still failed after format!");
+      return;
+    }
+    Serial.println("LittleFS formatted and mounted");
+  } else {
+    Serial.println("LittleFS mounted");
   }
-  Serial.println("LittleFS mounted");
   
   // Ensure /logs/ directory exists
   if (!LittleFS.exists("/logs")) {
@@ -1352,19 +1663,23 @@ void setup() {
     Serial.println("Created /logs directory");
   }
   
-  // Initialize SD card (optional)
-  if (SD.begin(SS)) {
+  // Initialize SD card (optional) - FireBeetle 2 SD_CS = 9
+  if (SD.begin(SD_CS)) {
     sdPresent = true;
     Serial.println("SD card initialized");
   } else {
     Serial.println("SD card not present or failed");
   }
   
-  // Initialize sensor
-  if (!sensor.begin()) {
-    Serial.println("Si7021 sensor not found!");
+  // I2C for SHT85 - FireBeetle 2 default SDA=1, SCL=2
+  Wire.begin(I2C_SDA, I2C_SCL);
+  // Initialize SHT85 sensor
+  if (!sht.begin()) {
+    Serial.println("SHT85 sensor not found!");
+    sensorPresent = false;
   } else {
-    Serial.println("Si7021 sensor initialized");
+    sensorPresent = true;
+    Serial.println("SHT85 sensor initialized");
   }
   
   // Load or create config FIRST (before RTC check)
@@ -1395,10 +1710,17 @@ void setup() {
     }
   }
   
-  // Setup WiFi AP
+  // Setup WiFi AP (WPA2 requires password length 8-63)
+  if (config.ap_password.length() < 8 || config.ap_password.length() > 63) {
+    config.ap_password = "logger123";
+    saveConfig();
+  }
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-  WiFi.softAP(config.ap_ssid.c_str(), config.ap_password.c_str());
+  bool apOk = WiFi.softAP(config.ap_ssid.c_str(), config.ap_password.c_str());
+  if (!apOk) {
+    Serial.println("ERROR: WiFi AP failed to start. Try power cycle or check password (8-63 chars).");
+  }
   Serial.println("AP started: " + config.ap_ssid);
   Serial.println("AP IP: " + apIP.toString());
   
@@ -1429,9 +1751,8 @@ void setup() {
   server.begin();
   Serial.println("Web server started");
   
-  // Initialize random seed
-  randomSeed(analogRead(0));
-  
+  // Randomness: use esp_random() directly for tokens/salts (no RNG seeding required)
+
   Serial.println("\nSetup complete!");
   Serial.println("Connect to: " + config.ap_ssid);
   Serial.println("Password: " + config.ap_password);
@@ -1452,36 +1773,71 @@ void loop() {
     lastHeartbeat = now;
   }
   
+  // SHT85 heater state machine (non-blocking): only when sensor present and mode != off
+  if (sensorPresent && config.heating_mode != "off") {
+    unsigned int durationSec = 10;
+    unsigned long intervalMs = 300000UL;   // 5 min
+    if (config.heating_mode == "1min_1hr") {
+      durationSec = 60;
+      intervalMs = 3600000UL;
+    } else if (config.heating_mode == "1min_1day") {
+      durationSec = 60;
+      intervalMs = 86400000UL;
+    }
+    const unsigned long durationMs = (unsigned long)durationSec * 1000UL;
+    
+    if (heaterActive) {
+      if (now - heaterStartMs >= durationMs) {
+        sht.heatOff();
+        lastHeaterCycleEndMs = now;
+        heaterActive = false;
+      }
+    } else {
+      if (lastHeaterCycleEndMs == 0 || (now - lastHeaterCycleEndMs >= intervalMs)) {
+        sht.setHeatTimeout((uint8_t)durationSec);
+        if (sht.heatOn()) {
+          heaterStartMs = now;
+          heaterActive = true;
+        } else {
+          lastHeaterCycleEndMs = now;  // avoid tight loop on failure
+        }
+      }
+    }
+  }
+  
   // Non-blocking sampling
   unsigned long intervalMs = (unsigned long)config.sample_period_s * 1000UL;
   
   // Take first sample immediately (lastSampleTime starts at 0)
-  // Then sample at configured interval
-  if (lastSampleTime == 0 || (now - lastSampleTime >= intervalMs)) {
-    float temperature = sensor.readTemperature();
-    float humidity = sensor.readHumidity();
-    
-    Serial.print("Sample #");
-    Serial.print(lastSampleTime == 0 ? 1 : (now / intervalMs) + 1);
-    Serial.print(": ");
-    Serial.print(temperature, 2);
-    Serial.print("°C, ");
-    Serial.print(humidity, 2);
-    Serial.print("%RH @ ");
-    Serial.println(getISOTimestamp());
-    
-    if (writeDataPoint(temperature, humidity)) {
-      Serial.println("  -> Saved to storage");
-      ledSampleFlash();  // Flash rapidly to indicate data saved
-    } else {
-      Serial.println("  -> ERROR saving!");
+  // Then sample at configured interval - only when sensor is present
+  // Skip sample when heater is on (readings would be invalid)
+  if (sensorPresent && (lastSampleTime == 0 || (now - lastSampleTime >= intervalMs))) {
+    if (sht.isHeaterOn()) {
+      lastSampleTime = now;
+    } else if (sht.read(true)) {
+      float temperature = sht.getTemperature();
+      float humidity = sht.getHumidity();
+      
+      Serial.print("Sample #");
+      Serial.print(lastSampleTime == 0 ? 1 : (now / intervalMs) + 1);
+      Serial.print(": ");
+      Serial.print(temperature, 2);
+      Serial.print("°C, ");
+      Serial.print(humidity, 2);
+      Serial.print("%RH @ ");
+      Serial.println(getISOTimestamp());
+      
+      if (writeDataPoint(temperature, humidity)) {
+        Serial.println("  -> Saved to storage");
+        ledSampleFlash();  // Flash rapidly to indicate data saved
+      } else {
+        Serial.println("  -> ERROR saving!");
+      }
+      lastSampleTime = now;
+      Serial.print("Next sample in ");
+      Serial.print(config.sample_period_s);
+      Serial.println(" seconds");
     }
-    
-    lastSampleTime = now;
-    
-    Serial.print("Next sample in ");
-    Serial.print(config.sample_period_s);
-    Serial.println(" seconds");
   }
   
   yield();

@@ -6,18 +6,14 @@ let statusRefreshInterval = null;
 
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', function() {
-    console.log('Initializing ESP8266 Logger...');
+    console.log('Initializing FireBeetle 2 SHT85 Logger...');
     initializeCharts();
     loadConfig();
     loadStorageStatus();
     checkTimeStatus();
     
     // Set default time range and auto-load data
-    setQuickRange(1); // Last 24 hours
-    setTimeout(function() {
-        loadData();
-        console.log('Initial data loaded');
-    }, 500);
+    setQuickRange(1, true); // Last 24 hours (silent)
     
     // Start live status updates (every 5 seconds)
     updateLiveStatus();
@@ -38,13 +34,22 @@ async function updateLiveStatus() {
         if (response.ok) {
             const data = await response.json();
             
-            // Update live readings
+            // Update live readings (handle no-sensor mode)
             const liveEl = document.getElementById('liveStatus');
             if (liveEl) {
-                const temp = data.sensor.temperature.toFixed(1);
-                const hum = data.sensor.humidity.toFixed(1);
-                liveEl.innerHTML = `<strong>${temp}°C</strong> | <strong>${hum}%RH</strong>`;
-                liveEl.className = 'status-badge status-ok';
+                const sensorOk = data.sensor && data.sensor.connected !== false &&
+                    data.sensor.temperature != null && data.sensor.humidity != null &&
+                    typeof data.sensor.temperature === 'number' && typeof data.sensor.humidity === 'number';
+                if (sensorOk) {
+                    const temp = data.sensor.temperature.toFixed(1);
+                    const hum = data.sensor.humidity.toFixed(1);
+                    const heaterOn = data.heating && data.heating.on === true;
+                    liveEl.innerHTML = `<strong>${temp}°C</strong> | <strong>${hum}%RH</strong>${heaterOn ? ' <span class="heater-indicator">Heater on</span>' : ''}`;
+                    liveEl.className = 'status-badge status-ok';
+                } else {
+                    liveEl.textContent = 'Sensor not connected';
+                    liveEl.className = 'status-badge status-warning';
+                }
             }
             
             // Update sample info
@@ -387,6 +392,8 @@ function updateSettingsForm() {
     document.getElementById('intervalValue').value = value;
     document.getElementById('intervalUnit').value = unit;
     updateIntervalConstraints();
+    const heatingEl = document.getElementById('heatingMode');
+    if (heatingEl) heatingEl.value = deviceConfig.heating_mode || 'off';
 }
 
 function updateIntervalConstraints() {
@@ -406,7 +413,7 @@ async function loadStorageStatus() {
             const data = await response.json();
             const lfs = data.lfs;
             const sd = data.sd;
-            
+
             let statusText = `LFS: ${formatBytes(lfs.free)} free`;
             if (sd.present) {
                 statusText += ` | SD: OK`;
@@ -552,16 +559,16 @@ async function setDeviceTime() {
 }
 
 // Set quick time range
-function setQuickRange(days) {
+function setQuickRange(days, silent = false) {
     const to = new Date();
     const from = new Date();
     from.setDate(from.getDate() - days);
-    
+
     document.getElementById('fromDate').value = formatDateTimeLocal(from);
     document.getElementById('toDate').value = formatDateTimeLocal(to);
 
     // Load immediately after changing the range for faster feedback
-    loadData(true);
+    loadData(silent);
 }
 
 // Format date for datetime-local input
@@ -741,13 +748,17 @@ async function saveSettings(event) {
         return;
     }
     
+    const heatingModeEl = document.getElementById('heatingMode');
+    const heatingMode = heatingModeEl && ['off', '10s_5min', '1min_1hr', '1min_1day'].includes(heatingModeEl.value)
+        ? heatingModeEl.value : 'off';
+    
     try {
         const response = await fetch('/api/config', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify({ sample_period_s: periodSeconds })
+            body: JSON.stringify({ sample_period_s: periodSeconds, heating_mode: heatingMode })
         });
         
         const data = await response.json();
